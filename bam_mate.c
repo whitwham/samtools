@@ -37,6 +37,268 @@ DEALINGS IN THE SOFTWARE.  */
 #include "htslib/sam.h"
 #include "samtools.h"
 
+
+/*
+ * What This Program is Supposed To Do:
+ * Fill in mate coordinates, ISIZE and mate related flags from a name-sorted
+ * alignment.
+ *
+ * How We Handle Input
+ *
+ * Secondary and supplementary Reads:
+ * -write to output unchanged
+ * All Reads:
+ * -if pos == 0 (1 based), tid == -1 set UNMAPPED flag
+ * single Reads:
+ * -if pos == 0 (1 based), tid == -1, or UNMAPPED then set UNMAPPED, pos = 0,
+ *  tid = -1
+ * -clear bad flags (PAIRED, MREVERSE, PROPER_PAIR)
+ * -set mpos = 0 (1 based), mtid = -1 and isize = 0
+ * -write to output
+ * Paired Reads:
+ * -if read is unmapped and mate is not, set pos and tid to equal that of mate
+ * -sync mate flags (MREVERSE, MUNMAPPED), mpos, mtid
+ * -recalculate ISIZE if possible, otherwise set it to 0
+ * -optionally clear PROPER_PAIR flag from reads where mapping or orientation
+ *  indicate this is not possible (Illumina orientation only)
+ * -calculate ct and apply to lowest positioned read
+ * -write to output
+ * Limitations
+ * -Does not handle tandem reads
+ * -Should mark supplementary reads the same as primary.
+ * Notes
+ * -CT definition appears to be something else in spec, this was in here before
+ *  I started tampering with it, anyone know what is going on here? To work
+ *  around this I have demoted the CT this tool generates to ct.
+ */
+
+
+typedef struct {
+    uint32_t count;         // original order in file
+    uint32_t pos;           // coordinate
+    uint32_t quality_score; // quality score (only primary reads used)
+    int primary;            // a primary read
+    int dir;                // direction of alignment with reference
+    int process;            // should entry be processed
+    int end;                // calculated end point
+    int write;              // write out alignment
+    bam1_t *bam;            // alignment itself
+    kstring_t cigar;        // cigar string
+} alignment_stat_t;
+
+typedef struct {
+    alignment_stat_t *a[2];
+    uint32_t n;
+} pair_holder_t;
+
+
+/* Get the pair from the list of alignments with the same name to do the
+   mate operations.  Calculate the quality score for use with supplementary duplicate
+   matching (if needed).
+*/
+static uint32_t get_quality_and_pair(pair_holder_t *pair, alignment_stat_t *align, size_t size) {
+    size_t i;
+    uint32_t quality = 0;
+    
+    for (i = 0; i < size; i++) {
+        if (align[i].primary) {
+            if (pair->n < 2) {
+                pair->a[pair->n] = &align[i];
+                
+                if (align[i].process) { 
+                    quality += align[i].quality_score;
+                }
+            }
+            
+            pair->n++;
+        }
+    }
+    
+    return quality;
+}
+
+/* The next three functions deal with the list of alignments with the same name.  Consisting of the
+   primary pair plus any secondary or supplementary reads.
+*/
+static int clear_alignments(alignment_stat_t *align, int start, int len, int release, int init) {
+    int i;
+    
+    for (i = start; i < len; i++) {
+        align[i].count = i;
+        align[i].pos = 0;
+        align[i].quality_score = 0;
+        align[i].primary = 0;
+        align[i].dir = 0;
+        align[i].process = 1;
+        align[i].write = 0;
+        
+        if (init) {
+            if ((align[i].bam = bam_init1()) == NULL) {
+                fprintf(stderr, "[bam_fixmate] error: unable to initialise bam entry.\n"); 
+                return 1;
+            }
+        }
+        
+        if (release) {
+            free(align[i].cigar.s);
+        }
+        
+        align[i].cigar.l = align[i].cigar.m = 0;
+        align[i].cigar.s = NULL;
+    }
+    
+    return 0;
+}
+
+
+static void bam_destroy_alignments(alignment_stat_t *align, int len) {
+    int i;
+    
+    for (i = 0; i < len; i++) {
+        bam_destroy1(align[i].bam);
+    }
+}
+
+
+static alignment_stat_t *resize_alignments(alignment_stat_t *align, size_t old_size, size_t size) {
+    alignment_stat_t *tmp;
+    
+    if ((tmp = realloc(align, size * sizeof(alignment_stat_t))) == NULL) {
+        fprintf(stderr, "[bam_fixmate] error: unable to allocate memory.\n");
+        return NULL;
+    }
+    
+    if (clear_alignments(tmp, old_size, size, 0, 1)) {
+        free(tmp);
+        return NULL;
+    }
+    
+    return tmp;
+}
+
+
+/* Add the combined primary quality score for use with duplicate supplementary matching. */
+static int add_primary_quality_score(bam1_t *b, uint32_t qs) {
+    uint8_t *data;
+    
+    if ((data = bam_aux_get(b, "qs")) != NULL) {
+        bam_aux_del(b, data);
+    }
+    
+    if (bam_aux_append(b, "qs", 'i', sizeof(uint32_t), (uint8_t*)&qs) == -1) {
+        return -1;
+    }
+    
+    return 0;
+}
+
+
+/* Add a tag consisting of all the coordinates, direction and cigar strings of all
+  the primary and supplementary alignments in the alignment list.  Used for trying
+  to get duplicates with matching supplementary reads. */ 
+static int add_alignment_stat(bam1_t *b, char *as_string) {
+    uint8_t *data;
+    
+    if ((data = bam_aux_get(b, "ps")) != NULL) {
+        bam_aux_del(b, data);
+    }
+    
+    if (bam_aux_append(b, "ps", 'Z', strlen(as_string) + 1, (uint8_t*)as_string) == -1) {
+        return -1;
+    }
+    
+    return 0;
+}
+
+
+/* Make the string used in the abpve. */
+static char *make_as_string(alignment_stat_t *align, size_t size) {
+    size_t ssize = 100, asize = 200;
+    char *ss_string, *as_string;
+    int written;
+    size_t i;
+    
+    if ((ss_string = malloc(ssize)) == NULL) {
+        fprintf(stderr, "[bam_fixmate] error: unable to allocate memory.\n");
+        return NULL;
+    }
+    
+    if ((as_string = calloc(sizeof(char), asize)) == NULL) {
+        fprintf(stderr, "[bam_fixmate] error: unable to allocate memory.\n");
+        return NULL;
+    }
+    
+    for (i = 0; i < size; i++) {
+        if (align[i].process) { 
+            while(1) {
+               if (i < size - 1) {
+                   written = snprintf(ss_string, ssize, "%d,%d,%s,",
+                               align[i].pos, align[i].dir, align[i].cigar.s);
+               } else {
+                   written = snprintf(ss_string, ssize, "%d,%d,%s",
+                               align[i].pos, align[i].dir, align[i].cigar.s);
+               }
+
+               if (written < 0 || written > ssize) {
+                   char *tmp;
+
+                   if (written > -1) {
+                       ssize = written + 1;
+                   } else {
+                       ssize *= 2;
+                   }
+
+                   if ((tmp = realloc(ss_string, ssize)) == NULL) {
+                       free(ss_string);
+                       return NULL;
+                   } else {
+                       ss_string = tmp;
+                   }
+               } else {
+                   break;
+               }
+           }
+
+           if ((written + strlen(as_string)) >= asize) {
+              char *tmp;
+
+              asize *= 2;
+
+              if ((tmp = realloc(as_string, asize)) == NULL) {
+                   free(as_string);
+                   return NULL;
+              } else {
+                   as_string = tmp;
+              }
+           }
+
+           strcat(as_string, ss_string);
+        }
+    }
+    
+    free(ss_string);
+    
+    return as_string;
+}
+
+
+/* Sort functions */
+static int coordinate_order(const void *p1, const void *p2) {
+    const alignment_stat_t *as1 = (alignment_stat_t*) p1;
+    const alignment_stat_t *as2 = (alignment_stat_t*) p2;
+
+    return (as1->pos - as2->pos);
+}
+
+
+static int original_order(const void *p1, const void *p2) {
+    const alignment_stat_t *as1 = (alignment_stat_t*) p1;
+    const alignment_stat_t *as2 = (alignment_stat_t*) p2;
+
+    return (as1->count - as2->count);
+}
+
+
 /*
  * This function calculates ct tag for two bams, it assumes they are from the same template and
  * writes the tag to the first read in position terms.
@@ -72,39 +334,6 @@ static void bam_template_cigar(bam1_t *b1, bam1_t *b2, kstring_t *str)
     bam_aux_append(b1, "ct", 'Z', str->l+1, (uint8_t*)str->s);
 }
 
-/*
- * What This Program is Supposed To Do:
- * Fill in mate coordinates, ISIZE and mate related flags from a name-sorted
- * alignment.
- *
- * How We Handle Input
- *
- * Secondary and supplementary Reads:
- * -write to output unchanged
- * All Reads:
- * -if pos == 0 (1 based), tid == -1 set UNMAPPED flag
- * single Reads:
- * -if pos == 0 (1 based), tid == -1, or UNMAPPED then set UNMAPPED, pos = 0,
- *  tid = -1
- * -clear bad flags (PAIRED, MREVERSE, PROPER_PAIR)
- * -set mpos = 0 (1 based), mtid = -1 and isize = 0
- * -write to output
- * Paired Reads:
- * -if read is unmapped and mate is not, set pos and tid to equal that of mate
- * -sync mate flags (MREVERSE, MUNMAPPED), mpos, mtid
- * -recalculate ISIZE if possible, otherwise set it to 0
- * -optionally clear PROPER_PAIR flag from reads where mapping or orientation
- *  indicate this is not possible (Illumina orientation only)
- * -calculate ct and apply to lowest positioned read
- * -write to output
- * Limitations
- * -Does not handle tandem reads
- * -Should mark supplementary reads the same as primary.
- * Notes
- * -CT definition appears to be something else in spec, this was in here before
- *  I started tampering with it, anyone know what is going on here? To work
- *  around this I have demoted the CT this tool generates to ct.
- */
 
 static void sync_unmapped_pos_inner(bam1_t* src, bam1_t* dest) {
     if ((dest->core.flag & BAM_FUNMAP) && !(src->core.flag & BAM_FUNMAP)) {
@@ -249,20 +478,142 @@ static int add_mate_score(bam1_t *src, bam1_t *dest)
     return 0;
 }
 
-// currently, this function ONLY works if each read has one hit
-static int bam_mating_core(samFile *in, samFile *out, int remove_reads, int proper_pair_check, int add_ct, int do_mate_scoring)
-{
-    bam_hdr_t *header;
-    bam1_t *b[2] = { NULL, NULL };
-    int curr, has_prev, pre_end = 0, cur_end = 0;
-    kstring_t str;
 
-    str.l = str.m = 0; str.s = 0;
-    header = sam_hdr_read(in);
-    if (header == NULL) {
-        fprintf(stderr, "[bam_mating_core] ERROR: Couldn't read header\n");
+
+/* Write out the group of reads with the same name.  Doing any mate fixing and adding any tags to
+   be used in other programs (e.g samtools markdup).
+*/
+static int write_out_group(samFile *out_file, bam_hdr_t *head, alignment_stat_t *align, int count, int supp, int remove_reads, int proper_pair_check, int add_ct, int do_mate_scoring) {
+    uint32_t quality_score = 0;
+    char *as_aux_str = NULL;
+    int i;
+    pair_holder_t pair;
+     
+    pair.n = 0;
+    quality_score = get_quality_and_pair(&pair, align, count);
+    
+    if (pair.n == 2) { // an actual pair of reads
+        bam1_t *b1 = pair.a[0]->bam;
+        bam1_t *b2 = pair.a[1]->bam;
+        
+        b1->core.flag |= BAM_FPAIRED;
+        b2->core.flag |= BAM_FPAIRED;
+        
+        if (sync_mate(b1, b2)) {
+            return 1;
+        }
+        
+        if (b1->core.tid == b2->core.tid && !(b1->core.flag&(BAM_FUNMAP|BAM_FMUNMAP))
+            && !(b2->core.flag&(BAM_FUNMAP|BAM_FMUNMAP))) // if safe set TLEN/ISIZE
+        {
+            uint32_t b1_5, b2_5;
+            b1_5 = (b1->core.flag&BAM_FREVERSE)? pair.a[0]->end : b1->core.pos;
+            b2_5 = (b2->core.flag&BAM_FREVERSE)? pair.a[1]->end : b2->core.pos;
+            b1->core.isize = b2_5 - b1_5; b2->core.isize = b1_5 - b2_5;
+        } else b1->core.isize = b2->core.isize = 0;
+        
+        if (add_ct) {
+            kstring_t str;
+            
+            str.l = str.m = 0; str.s = 0;
+            bam_template_cigar(b1, b2, &str);
+            free(str.s);
+        }
+
+        // TODO: Add code to properly check if read is in a proper pair based on ISIZE distribution
+        if (proper_pair_check && !plausibly_properly_paired(b1, b2)) {
+            b1->core.flag &= ~BAM_FPROPER_PAIR;
+            b2->core.flag &= ~BAM_FPROPER_PAIR;
+        }
+        
+        if (do_mate_scoring) {
+            if ((add_mate_score(b2, b1) == -1) || (add_mate_score(b1, b2) == -1)) {
+                fprintf(stderr, "[bam_mating_core] ERROR: unable to add mate score.\n");
+                return 1;
+            }
+        }
+        
+        if (remove_reads) {
+            // If we have to remove reads make sure we do it in a way that doesn't create orphans with bad flags
+            if(b2->core.flag&BAM_FUNMAP) b1->core.flag &= ~(BAM_FPAIRED|BAM_FMREVERSE|BAM_FPROPER_PAIR);
+            if(b1->core.flag&BAM_FUNMAP) b2->core.flag &= ~(BAM_FPAIRED|BAM_FMREVERSE|BAM_FPROPER_PAIR);
+        }
+    } else if (pair.n == 1) {
+        bam1_t *b1 = pair.a[0]->bam;
+        
+        if (b1->core.tid < 0 || b1->core.pos < 0 || b1->core.flag&BAM_FUNMAP) { // If unmapped
+            b1->core.flag |= BAM_FUNMAP;
+            b1->core.tid = -1;
+            b1->core.pos = -1;
+            pair.a[0]->write = 0;
+        }
+        
+        b1->core.mtid = -1; b1->core.mpos = -1; b1->core.isize = 0;
+        b1->core.flag &= ~(BAM_FPAIRED|BAM_FMREVERSE|BAM_FPROPER_PAIR);
+    } else {
+        fprintf(stderr, "[bam_mating_core] WARNING: %d primary reads in group.\n", pair.n);
+    }
+
+    if (supp) {
+        // sort by coordinate so everything in the as tag will be in the same order
+        qsort(align, count, sizeof(alignment_stat_t), coordinate_order);
+        as_aux_str    = make_as_string(align, count);
+    }
+    
+    // back to the input order
+    qsort(align, count, sizeof(alignment_stat_t), original_order);
+
+    for (i = 0; i < count; i++) {
+        if (align[i].process && supp) {
+            add_alignment_stat(align[i].bam, as_aux_str);
+            add_primary_quality_score(align[i].bam, quality_score);
+        }
+
+        if (!remove_reads || align[i].write) {
+            if (sam_write1(out_file, head, align[i].bam) < 0) {
+                fprintf(stderr, "[bam_fixmate] error: writing final output failed.\n");
+                return 1;
+            }
+        }
+    }
+
+    if (clear_alignments(align, 0, count, 1, 0)) {
         return 1;
     }
+    
+    free(as_aux_str);
+    
+    return 0;
+}
+
+
+
+/* Read in a group of alignments of the same name, fixing flags as we go.  Finished groups go to write_out_groups for
+   further processing.
+*/
+static int bam_mating_core(samFile *in, samFile *out, int remove_reads, int proper_pair_check, int add_ct, int do_mate_scoring, int alt_supp) {
+    bam_hdr_t *header;
+    bam1_t *prev_read = NULL;
+    int ret;
+    alignment_stat_t *alignment;
+    size_t alignment_size = 6;
+    int align_no = 0, has_supp = 0;
+    
+    
+    if ((alignment = malloc(alignment_size * sizeof(alignment_stat_t))) == NULL) {
+    	fprintf(stderr, "[bam_mating_core] ERROR: unable to allocate memory for alignment array.\n");
+	return 1;
+    }
+    
+    if (clear_alignments(alignment, 0, alignment_size, 0, 1)) {
+        return 1;
+    }
+   
+    if ((header = sam_hdr_read(in)) == NULL) {
+    	fprintf(stderr, "[bam_mating_core] ERROR: could not read header.\n");
+	return 1;
+    }
+    
     // Accept unknown, unsorted, or queryname sort order, but error on coordinate sorted.
     if ((header->l_text > 3) && (strncmp(header->text, "@HD", 3) == 0)) {
         char *p, *q;
@@ -272,125 +623,108 @@ static int bam_mating_core(samFile *in, samFile *out, int remove_reads, int prop
         // (e.g. must ignore in a @CO comment line later in header)
         if ((p != 0) && (p < q)) {
             fprintf(stderr, "[bam_mating_core] ERROR: Coordinate sorted, require grouped/sorted by queryname.\n");
-            goto fail;
+            ret = 1;
+            goto cleanup;
         }
     }
-    if (sam_hdr_write(out, header) < 0) goto write_fail;
 
-    b[0] = bam_init1();
-    b[1] = bam_init1();
-    curr = 0; has_prev = 0;
-    while (sam_read1(in, header, b[curr]) >= 0) {
-        bam1_t *cur = b[curr], *pre = b[1-curr];
-        if (cur->core.flag & BAM_FSECONDARY)
-        {
-            if ( !remove_reads ) {
-                if (sam_write1(out, header, cur) < 0) goto write_fail;
+    if (sam_hdr_write(out, header) < 0) {
+    	fprintf(stderr, "[bam_mating_core] ERROR: could not write header.\n");
+        ret = 1;
+	goto cleanup;
+    }
+    
+    // read all the alginemnts with the same name and deal with them as a group
+    while ((ret = sam_read1(in, header, alignment[align_no].bam)) >= 0) {
+        bam1_t *cur = alignment[align_no].bam;
+        
+        if (prev_read) {
+            if (strcmp(bam_get_qname(cur), bam_get_qname(prev_read)) != 0) {
+
+                if (write_out_group(out, header, alignment, align_no, has_supp, remove_reads, proper_pair_check, add_ct, do_mate_scoring)) {
+                    ret = 1;
+                    goto cleanup;
+                }
+                
+                bam_copy1(alignment[0].bam, cur);
+                
+                align_no = 0;
+                has_supp = 0;
             }
-            continue; // skip secondary alignments
         }
-        if (cur->core.flag & BAM_FSUPPLEMENTARY)
-        {
-            if (sam_write1(out, header, cur) < 0) goto write_fail;
-            continue; // pass supplementary alignments through unchanged (TODO:make them match read they came from)
-        }
-        if (cur->core.tid < 0 || cur->core.pos < 0) // If unmapped set the flag
-        {
-            cur->core.flag |= BAM_FUNMAP;
-        }
-        if ((cur->core.flag&BAM_FUNMAP) == 0) // If mapped calculate end
-        {
-            cur_end = bam_endpos(cur);
-
-            // Check cur_end isn't past the end of the contig we're on, if it is set the UNMAP'd flag
-            if (cur_end > (int)header->target_len[cur->core.tid]) cur->core.flag |= BAM_FUNMAP;
-        }
-        if (has_prev) { // do we have a pair of reads to examine?
-            if (strcmp(bam_get_qname(cur), bam_get_qname(pre)) == 0) { // identical pair name
-                pre->core.flag |= BAM_FPAIRED;
-                cur->core.flag |= BAM_FPAIRED;
-                if (sync_mate(pre, cur)) goto fail;
-
-                if (pre->core.tid == cur->core.tid && !(cur->core.flag&(BAM_FUNMAP|BAM_FMUNMAP))
-                    && !(pre->core.flag&(BAM_FUNMAP|BAM_FMUNMAP))) // if safe set TLEN/ISIZE
-                {
-                    uint32_t cur5, pre5;
-                    cur5 = (cur->core.flag&BAM_FREVERSE)? cur_end : cur->core.pos;
-                    pre5 = (pre->core.flag&BAM_FREVERSE)? pre_end : pre->core.pos;
-                    cur->core.isize = pre5 - cur5; pre->core.isize = cur5 - pre5;
-                } else cur->core.isize = pre->core.isize = 0;
-                if (add_ct) bam_template_cigar(pre, cur, &str);
-                // TODO: Add code to properly check if read is in a proper pair based on ISIZE distribution
-                if (proper_pair_check && !plausibly_properly_paired(pre,cur)) {
-                    pre->core.flag &= ~BAM_FPROPER_PAIR;
-                    cur->core.flag &= ~BAM_FPROPER_PAIR;
-                }
-
-                if (do_mate_scoring) {
-                    if ((add_mate_score(pre, cur) == -1) || (add_mate_score(cur, pre) == -1)) {
-                        fprintf(stderr, "[bam_mating_core] ERROR: unable to add mate score.\n");
-                        goto fail;
-                    }
-                }
-
-                // Write out result
-                if ( !remove_reads ) {
-                    if (sam_write1(out, header, pre) < 0) goto write_fail;
-                    if (sam_write1(out, header, cur) < 0) goto write_fail;
-                } else {
-                    // If we have to remove reads make sure we do it in a way that doesn't create orphans with bad flags
-                    if(pre->core.flag&BAM_FUNMAP) cur->core.flag &= ~(BAM_FPAIRED|BAM_FMREVERSE|BAM_FPROPER_PAIR);
-                    if(cur->core.flag&BAM_FUNMAP) pre->core.flag &= ~(BAM_FPAIRED|BAM_FMREVERSE|BAM_FPROPER_PAIR);
-                    if(!(pre->core.flag&BAM_FUNMAP)) {
-                        if (sam_write1(out, header, pre) < 0) goto write_fail;
-                    }
-                    if(!(cur->core.flag&BAM_FUNMAP)) {
-                        if (sam_write1(out, header, cur) < 0) goto write_fail;
-                    }
-                }
-                has_prev = 0;
-            } else { // unpaired?  clear bad info and write it out
-                if (pre->core.tid < 0 || pre->core.pos < 0 || pre->core.flag&BAM_FUNMAP) { // If unmapped
-                    pre->core.flag |= BAM_FUNMAP;
-                    pre->core.tid = -1;
-                    pre->core.pos = -1;
-                }
-                pre->core.mtid = -1; pre->core.mpos = -1; pre->core.isize = 0;
-                pre->core.flag &= ~(BAM_FPAIRED|BAM_FMREVERSE|BAM_FPROPER_PAIR);
-                if ( !remove_reads || !(pre->core.flag&BAM_FUNMAP) ) {
-                    if (sam_write1(out, header, pre) < 0) goto write_fail;
-                }
+        
+        if (!(cur->core.flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY))) {
+            if (cur->core.tid < 0 || cur->core.pos < 0) // If unmapped set the flag
+            {
+                cur->core.flag |= BAM_FUNMAP;
             }
-        } else has_prev = 1;
-        curr = 1 - curr;
-        pre_end = cur_end;
-    }
-    if (has_prev && !remove_reads) { // If we still have a BAM in the buffer it must be unpaired
-        bam1_t *pre = b[1-curr];
-        if (pre->core.tid < 0 || pre->core.pos < 0 || pre->core.flag&BAM_FUNMAP) { // If unmapped
-            pre->core.flag |= BAM_FUNMAP;
-            pre->core.tid = -1;
-            pre->core.pos = -1;
+            
+            if ((cur->core.flag&BAM_FUNMAP) == 0) // If mapped calculate end
+            {
+                alignment[align_no].end = bam_endpos(cur);
+
+                // Check cur_end isn't past the end of the contig we're on, if it is set the UNMAP'd flag
+                if (alignment[align_no].end > (int)header->target_len[cur->core.tid]) cur->core.flag |= BAM_FUNMAP;
+            }
+            
+            alignment[align_no].primary = 1;
         }
-        pre->core.mtid = -1; pre->core.mpos = -1; pre->core.isize = 0;
-        pre->core.flag &= ~(BAM_FPAIRED|BAM_FMREVERSE|BAM_FPROPER_PAIR);
-
-        if (sam_write1(out, header, pre) < 0) goto write_fail;
+        
+        if (!(cur->core.flag & (BAM_FSECONDARY | BAM_FUNMAP | BAM_FQCFAIL))) {
+            if (cur->core.flag & BAM_FSUPPLEMENTARY && alt_supp) has_supp = 1;
+        
+            alignment[align_no].pos           = cur->core.pos;
+            alignment[align_no].quality_score = calc_mate_score(cur);
+            alignment[align_no].write         = 1;
+            
+            if (bam_is_rev(cur)) {
+                alignment[align_no].dir = -1;
+            } else {
+                alignment[align_no].dir = 1;
+            }
+            
+            bam_format_cigar(cur, &(alignment[align_no].cigar));
+        } else {
+            alignment[align_no].process = 0;
+        }
+        
+        prev_read = alignment[align_no].bam;
+        align_no++;
+        
+        if (align_no >= alignment_size) {
+            size_t old_size = alignment_size;
+            alignment_size *= 2;
+            
+            if ((alignment = resize_alignments(alignment, old_size, alignment_size)) == NULL) {
+   	        fprintf(stderr, "[bam_mating_core] ERROR: could not resize alignments.\n");
+                ret = 1;
+                goto cleanup;
+            }
+        }
     }
-    bam_hdr_destroy(header);
-    bam_destroy1(b[0]);
-    bam_destroy1(b[1]);
-    free(str.s);
-    return 0;
+    
+    if (ret < -1) {
+        fprintf(stderr, "[bam_mating_core] ERROR: truncated input file.\n");
+        ret = 1;
+        goto cleanup;
+    }
+    
+    // do the last remaining reads    
+    if (write_out_group(out, header, alignment, align_no, has_supp, remove_reads, proper_pair_check, add_ct, do_mate_scoring)) {
+        ret = 1;
+        goto cleanup;
+    }
+    
+    ret = 0;    
 
- write_fail:
-    print_error_errno("fixmate", "Couldn't write to output file");
- fail:
+ cleanup:    
+    bam_destroy_alignments(alignment, alignment_size);
+    free(alignment);
     bam_hdr_destroy(header);
-    bam_destroy1(b[0]);
-    bam_destroy1(b[1]);
-    return 1;
+
+    return ret;
 }
+
 
 void usage(FILE* where)
 {
@@ -400,7 +734,8 @@ void usage(FILE* where)
 "  -r           Remove unmapped reads and secondary alignments\n"
 "  -p           Disable FR proper pair check\n"
 "  -c           Add template cigar ct tag\n"
-"  -m           Add mate score tag\n");
+"  -m           Add mate score tag\n"
+"  -a           Add extended supplementary duplication tags\n");
 
     sam_global_opt_help(where, "-.O..@");
 
@@ -415,7 +750,7 @@ int bam_mating(int argc, char *argv[])
 {
     htsThreadPool p = {NULL, 0};
     samFile *in = NULL, *out = NULL;
-    int c, remove_reads = 0, proper_pair_check = 1, add_ct = 0, res = 1, mate_score = 0;
+    int c, remove_reads = 0, proper_pair_check = 1, add_ct = 0, res = 1, mate_score = 0, alt_supp = 0;
     sam_global_args ga = SAM_GLOBAL_ARGS_INIT;
     char wmode[3] = {'w', 'b', 0};
     static const struct option lopts[] = {
@@ -425,12 +760,13 @@ int bam_mating(int argc, char *argv[])
 
     // parse args
     if (argc == 1) { usage(stdout); return 0; }
-    while ((c = getopt_long(argc, argv, "rpcmO:@:", lopts, NULL)) >= 0) {
+    while ((c = getopt_long(argc, argv, "rpcmaO:@:", lopts, NULL)) >= 0) {
         switch (c) {
             case 'r': remove_reads = 1; break;
             case 'p': proper_pair_check = 0; break;
             case 'c': add_ct = 1; break;
             case 'm': mate_score = 1; break;
+            case 'a': alt_supp = 1; break;
             default:  if (parse_sam_global_opt(c, optarg, lopts, &ga) == 0) break;
                       /* else fall-through */
             case '?': usage(stderr); goto fail;
@@ -459,7 +795,7 @@ int bam_mating(int argc, char *argv[])
     }
 
     // run
-    res = bam_mating_core(in, out, remove_reads, proper_pair_check, add_ct, mate_score);
+    res = bam_mating_core(in, out, remove_reads, proper_pair_check, add_ct, mate_score, alt_supp);
 
     // cleanup
     sam_close(in);

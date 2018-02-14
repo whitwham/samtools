@@ -1,7 +1,7 @@
 /*  bam_markdup.c -- Mark duplicates from a coord sorted file that has gone
                      through fixmates with the mate scoring option on.
 
-    Copyright (C) 2017 Genome Research Ltd.
+    Copyright (C) 2017-18 Genome Research Ltd.
 
     Author: Andrew Whitwham <aw7@sanger.ac.uk>
 
@@ -50,6 +50,10 @@ typedef struct {
     int32_t other_coord;
     int32_t leftmost;
     int32_t orientation;
+    int32_t is_supp;
+    int32_t has_supp;
+    int32_t supp;
+    int32_t primary;
 } key_data_t;
 
 typedef struct {
@@ -72,15 +76,19 @@ static khint_t hash_key(key_data_t key) {
     khint_t hash;
 
     if (key.single) {
-        unsigned char sig[12];
+        unsigned char sig[32];
 
         memcpy(sig + i, &key.this_ref, 4);      i += 4;
         memcpy(sig + i, &key.this_coord, 4);    i += 4;
         memcpy(sig + i, &key.orientation, 4);   i += 4;
+        memcpy(sig + i, &key.is_supp, 4);       i += 4;
+        memcpy(sig + i, &key.has_supp, 4);      i += 4;
+        memcpy(sig + i, &key.supp, 4);          i += 4;
+        memcpy(sig + i, &key.primary, 4);       i += 4;
 
         hash = do_hash(sig, i);
     } else {
-        unsigned char sig[24];
+        unsigned char sig[36];
 
         memcpy(sig + i, &key.this_ref, 4);      i += 4;
         memcpy(sig + i, &key.this_coord, 4);    i += 4;
@@ -88,6 +96,9 @@ static khint_t hash_key(key_data_t key) {
         memcpy(sig + i, &key.other_coord, 4);   i += 4;
         memcpy(sig + i, &key.leftmost, 4);      i += 4;
         memcpy(sig + i, &key.orientation, 4);   i += 4;
+        memcpy(sig + i, &key.has_supp, 4);      i += 4;
+        memcpy(sig + i, &key.supp, 4);          i += 4;
+        memcpy(sig + i, &key.primary, 4);       i += 4;
 
         hash = do_hash(sig, i);
     }
@@ -107,8 +118,19 @@ static int key_equal(key_data_t a, key_data_t b) {
         match = 0;
     else if (a.single != b.single)
         match = 0;
+    else if (a.has_supp != b.has_supp)
+        match = 0;
+    else if (a.supp != b.supp)
+        match = 0;
+    else if (a.primary != b.primary)
+        match = 0;
 
-    if (!a.single) {
+    if (a.single && match) {
+        if (a.is_supp != b.is_supp)
+            match = 0;
+    }
+
+    if (!a.single && match) {
         if (a.other_coord != b.other_coord)
             match = 0;
         else if (a.leftmost != b.leftmost)
@@ -300,12 +322,113 @@ static int64_t calc_score(bam1_t *b)
 }
 
 
+static int64_t get_primary_score(bam1_t *b) {
+    uint8_t *data;
+    int64_t score;
+
+    if ((data = bam_aux_get(b, "qs"))) {
+        score = bam_aux2i(data);
+    } else {
+        fprintf(stderr, "[markdup] error: no qs score tag.\n");
+        return -1;
+    }
+
+    return score;
+}
+
+
+static int32_t read_supplementary_tag(bam1_t *b, key_data_t *k) {
+    int32_t ret = 0;
+    uint8_t *data;
+    
+    if ((data = bam_aux_get(b, "SA"))) {
+        char *supp = bam_aux2Z(data);
+        char *supi = supp;
+        int32_t supp_no = 0;
+        size_t max_len = strlen(supp);
+        size_t sig_len = 0;
+        unsigned char *sig;
+        int com_count = 0;
+        
+        if ((sig = malloc(max_len)) == NULL) {
+            fprintf(stderr, "[markdup] error: unable to allocate memory.\n");
+            return -1;
+        }
+        
+        while (*supi) {
+            if (*supi == ',') {
+                com_count++;
+                
+                if (com_count == 4) {
+                    com_count = 0;
+                
+                    while (*supi) {
+                        if (*supi == ';') {
+                            supp_no++;
+                            supi++;
+                            break;
+                        }
+                        
+                        supi++;
+                    }
+                } else {
+                    supi++;
+                }
+            } else {
+                sig[sig_len++] = *supi;
+                supi++;
+            }
+        }
+        
+        if (supp_no == 0) {
+            // error should be at least one ';'
+            fprintf(stderr, "[markdup] error: malformed SA tag: %s\n", supp);
+            return -1;
+        }
+        
+        k->has_supp = supp_no;
+        k->supp     = do_hash(sig, sig_len);
+        
+        sig[sig_len] = 0;
+        // fprintf(stderr, "SIG:%s\n", sig); 
+        
+        free(sig);
+        ret =  1;
+    } else {
+        k->has_supp = 0;
+        k->supp = 0;
+    }
+    
+    return ret;
+}
+        
+   
+static int32_t read_supp_alignment_tag(bam1_t *b, key_data_t *k) {
+    int32_t ret = 0;
+    uint8_t *data;
+    
+    if ((data = bam_aux_get(b, "ps"))) {
+        char *supp = bam_aux2Z(data);
+        
+        k->primary = do_hash((unsigned char *)supp, strlen(supp));
+        
+        ret =  1;
+    } else {
+        k->primary = 0;
+    }
+    
+    return ret;
+}
+
+
+
+
 /* Create a signature hash of the current read and its pair.
    Uses the unclipped start (or end depending on orientation),
    the reference id, orientation and whether the current
    read is leftmost of the pair. */
 
-static int make_pair_key(key_data_t *key, bam1_t *bam) {
+static int make_pair_key(key_data_t *key, bam1_t *bam, int alt_supp) {
     int32_t this_ref, this_coord, this_end;
     int32_t other_ref, other_coord, other_end;
     int32_t orientation, leftmost;
@@ -405,6 +528,18 @@ static int make_pair_key(key_data_t *key, bam1_t *bam) {
         leftmost = 13;
     else
         leftmost = 11;
+        
+    if (alt_supp) {    
+        if (read_supplementary_tag(bam, key) < 0) {
+            return 1;
+        }
+
+        read_supp_alignment_tag(bam, key);
+    } else {
+        key->has_supp = 0;
+        key->primary  = 0;
+        key->supp     = 0;
+    }
 
     key->single        = 0;
     key->this_ref      = this_ref;
@@ -413,6 +548,7 @@ static int make_pair_key(key_data_t *key, bam1_t *bam) {
     key->other_coord   = other_coord;
     key->leftmost      = leftmost;
     key->orientation   = orientation;
+    key->is_supp       = 0; // paired is not going to be supplementary
 
     return 0;
 }
@@ -422,9 +558,10 @@ static int make_pair_key(key_data_t *key, bam1_t *bam) {
    Uses unclipped start (or end depending on orientation), reference id,
    and orientation. */
 
-static void make_single_key(key_data_t *key, bam1_t *bam) {
+static int make_single_key(key_data_t *key, bam1_t *bam, int alt_supp) {
     int32_t this_ref, this_coord;
     int32_t orientation;
+    int has_supp_tag, has_as_tag;
 
     this_ref = bam->core.tid + 1; // avoid a 0 being put into the hash
 
@@ -435,11 +572,37 @@ static void make_single_key(key_data_t *key, bam1_t *bam) {
         this_coord = unclipped_start(bam);
         orientation = O_FF;
     }
+    
+    key->is_supp = 0;
+    
+    if (alt_supp) {
+        if ((has_supp_tag = read_supplementary_tag(bam, key)) < 0) {
+            return 1;
+        }
+
+        has_as_tag = read_supp_alignment_tag(bam, key);
+
+        if (bam->core.flag & BAM_FSUPPLEMENTARY) {
+            if (!has_supp_tag || !has_as_tag) {
+                fprintf(stderr, " [markdup] error: supplementary read does not has 'SA' or 'ps' tag.\n");
+                return -1;
+            }
+
+            key->is_supp = 1;
+        }
+    } else {
+        key->has_supp = 0;
+        key->primary  = 0;
+        key->supp     = 0;
+    }
+        
 
     key->single        = 1;
     key->this_ref      = this_ref;
     key->this_coord    = this_coord;
     key->orientation   = orientation;
+    
+    return 0;
 }
 
 /* Add the duplicate name to a hash if it does not exist. */
@@ -476,20 +639,20 @@ static int add_duplicate(khash_t(duplicates) *d_hash, bam1_t *dupe) {
    Marking the supplementary reads of a duplicate as also duplicates takes an extra file read/write
    step.  This is because the duplicate can occur before the primary read.*/
 
-static int bam_mark_duplicates(samFile *in, samFile *out, char *prefix, int remove_dups, int32_t max_length, int do_stats, int supp, int tag) {
+static int bam_mark_duplicates(samFile *in, samFile *out, char *prefix, int remove_dups, int32_t max_length, int do_stats, int supp, int tag, int alt_supp) {
     bam_hdr_t *header;
     khiter_t k;
     khash_t(reads) *pair_hash        = kh_init(reads);
     khash_t(reads) *single_hash      = kh_init(reads);
     klist_t(read_queue) *read_buffer = kl_init(read_queue);
     kliter_t(read_queue) *rq;
-    khash_t(duplicates) *dup_hash    = kh_init(duplicates);
+    khash_t(duplicates) *dup_hash = kh_init(duplicates);  // only used with alternate supplementary marking
     int32_t prev_tid, prev_coord;
     read_queue_t *in_read;
     int ret;
     int reading, writing, excluded, duplicate, single, pair, single_dup, examined;
     tmp_file_t temp;
-
+    
     if ((header = sam_hdr_read(in)) == NULL) {
         fprintf(stderr, "[markdup] error reading header\n");
         return 1;
@@ -556,23 +719,27 @@ static int bam_mark_duplicates(samFile *in, samFile *out, char *prefix, int remo
         reading++;
 
         // read must not be secondary, supplementary, unmapped or failed QC
-        if (!(in_read->b->core.flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY | BAM_FUNMAP | BAM_FQCFAIL))) {
+        if (!(in_read->b->core.flag & (BAM_FSECONDARY | BAM_FUNMAP | BAM_FQCFAIL | BAM_FSUPPLEMENTARY)) || 
+            (alt_supp && !(in_read->b->core.flag & (BAM_FSECONDARY | BAM_FUNMAP | BAM_FQCFAIL)))) {
             examined++;
 
 
             // look at the pairs first
-            if ((in_read->b->core.flag & BAM_FPAIRED) && !(in_read->b->core.flag & BAM_FMUNMAP)) {
+            if ((in_read->b->core.flag & BAM_FPAIRED) && !((in_read->b->core.flag & BAM_FMUNMAP) || (in_read->b->core.flag & BAM_FSUPPLEMENTARY))) {
                 int ret, mate_tmp;
                 key_data_t pair_key;
                 key_data_t single_key;
                 in_hash_t *bp;
 
-                if (make_pair_key(&pair_key, in_read->b)) {
+                if (make_pair_key(&pair_key, in_read->b, alt_supp)) {
                     fprintf(stderr, "[markdup] error: unable to assign pair hash key.\n");
                     return 1;
                 }
 
-                make_single_key(&single_key, in_read->b);
+                if (make_single_key(&single_key, in_read->b, alt_supp)) {
+                    fprintf(stderr, "[markdup] error: unable to assign single hash key.\n");
+                    return 1;
+                }
 
                 pair++;
                 in_read->pos = single_key.this_coord; // cigar/orientation modified pos
@@ -693,7 +860,10 @@ static int bam_mark_duplicates(samFile *in, samFile *out, char *prefix, int remo
                 key_data_t single_key;
                 in_hash_t *bp;
 
-                make_single_key(&single_key, in_read->b);
+                if (make_single_key(&single_key, in_read->b, alt_supp)) {
+                    fprintf(stderr, "[markdup] error: unable to assign single hash key.\n");
+                    return 1;
+                }
 
                 single++;
                 in_read->pos = single_key.this_coord; // cigar/orientation modified pos
@@ -707,7 +877,8 @@ static int bam_mark_duplicates(samFile *in, samFile *out, char *prefix, int remo
                 } else if (ret == 0) { // exists
                     bp = &kh_val(single_hash, k);
 
-                    if ((bp->p->core.flag & BAM_FPAIRED) && !(bp->p->core.flag & BAM_FMUNMAP)) {
+                    if ((bp->p->core.flag & BAM_FPAIRED) && !(bp->p->core.flag & BAM_FMUNMAP) &&
+                        !((bp->p->core.flag & BAM_FSUPPLEMENTARY) && alt_supp)) {
                         // if matched against one of a pair just mark as duplicate
 
                         if (tag) {
@@ -729,9 +900,15 @@ static int bam_mark_duplicates(samFile *in, samFile *out, char *prefix, int remo
                     } else {
                         int64_t old_score, new_score;
                         bam1_t *dup;
-
-                        old_score = calc_score(bp->p);
-                        new_score = calc_score(in_read->b);
+                        
+                        if (alt_supp && (bp->p->core.flag & BAM_FSUPPLEMENTARY && in_read->b->core.flag & BAM_FSUPPLEMENTARY)) {
+                            // compare the primary qualities not that of the supplementary itself
+                            old_score = get_primary_score(bp->p);
+                            new_score = get_primary_score(in_read->b);
+                        } else {
+                            old_score = calc_score(bp->p);
+                            new_score = calc_score(in_read->b);
+                        }
 
                         // choose the highest score as the original, add it
                         // to the single hash and mark the other as duplicate
@@ -933,6 +1110,7 @@ static int markdup_usage(void) {
     fprintf(stderr, "  -S           Mark supplemenary alignments of duplicates as duplicates (slower).\n");
     fprintf(stderr, "  -s           Report stats.\n");
     fprintf(stderr, "  -T PREFIX    Write temporary files to PREFIX.samtools.nnnn.nnnn.tmp.\n");
+    fprintf(stderr, "  -a           Alternate suplementary marking algorithm (incompatible with -S).\n");
     fprintf(stderr, "  -t           Mark primary duplicates with the name of the original in a \'do\' tag."
                                   " Mainly for information and debugging.\n");
 
@@ -946,7 +1124,7 @@ static int markdup_usage(void) {
 
 
 int bam_markdup(int argc, char **argv) {
-    int c, ret, remove_dups = 0, report_stats = 0, include_supplementary = 0, tag_dup = 0;
+    int c, ret, remove_dups = 0, report_stats = 0, include_supplementary = 0, tag_dup = 0, alt_supp = 0;
     int32_t max_length = 300;
     samFile *in = NULL, *out = NULL;
     char wmode[3] = {'w', 'b', 0};
@@ -961,7 +1139,7 @@ int bam_markdup(int argc, char **argv) {
         {NULL, 0, NULL, 0}
     };
 
-    while ((c = getopt_long(argc, argv, "rsl:StT:O:@:", lopts, NULL)) >= 0) {
+    while ((c = getopt_long(argc, argv, "rsl:StaT:O:@:", lopts, NULL)) >= 0) {
         switch (c) {
             case 'r': remove_dups = 1; break;
             case 'l': max_length = atoi(optarg); break;
@@ -969,6 +1147,7 @@ int bam_markdup(int argc, char **argv) {
             case 'T': kputs(optarg, &tmpprefix); break;
             case 'S': include_supplementary = 1; break;
             case 't': tag_dup = 1; break;
+            case 'a': alt_supp = 1; break;
             default: if (parse_sam_global_opt(c, optarg, lopts, &ga) == 0) break;
             /* else fall-through */
             case '?': return markdup_usage();
@@ -977,6 +1156,11 @@ int bam_markdup(int argc, char **argv) {
 
     if (optind + 2 > argc)
         return markdup_usage();
+        
+    if (include_supplementary && alt_supp) {
+        fprintf(stderr, "[markdup] error: incompatible command line oprions -S and -a.\n\n");
+        return markdup_usage();
+    }
 
     in = sam_open_format(argv[optind], "r", &ga.in);
 
@@ -1021,7 +1205,7 @@ int bam_markdup(int argc, char **argv) {
     t = ((unsigned) time(NULL)) ^ ((unsigned) clock());
     ksprintf(&tmpprefix, "samtools.%d.%u.tmp", (int) getpid(), t % 10000);
 
-    ret = bam_mark_duplicates(in, out, tmpprefix.s, remove_dups, max_length, report_stats, include_supplementary, tag_dup);
+    ret = bam_mark_duplicates(in, out, tmpprefix.s, remove_dups, max_length, report_stats, include_supplementary, tag_dup, alt_supp);
 
     sam_close(in);
 
