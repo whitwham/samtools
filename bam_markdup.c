@@ -954,7 +954,7 @@ static int bam_mark_duplicates(md_param_t *param) {
                 "EXAMINED: %d\n"
                 "PAIRED: %d\n"
                 "SINGLE: %d\n"
-                "DULPICATE PAIR: %d\n" 
+                "DUPLICATE PAIR: %d\n" 
                 "DUPLICATE SINGLE: %d\n"
                 "DUPLICATE TOTAL: %d\n", reading, writing, excluded, examined, pair, single,
                                 duplicate, single_dup, single_dup + duplicate);
