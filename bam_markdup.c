@@ -38,6 +38,7 @@ DEALINGS IN THE SOFTWARE
 #include "htslib/sam.h"
 #include "sam_opts.h"
 #include "samtools.h"
+#include "htslib/cram.h"
 #include "htslib/khash.h"
 #include "htslib/klist.h"
 #include "htslib/kstring.h"
@@ -692,7 +693,7 @@ static unsigned long estimate_library_size(unsigned long read_pairs, unsigned lo
    Marking the supplementary reads of a duplicate as also duplicates takes an extra file read/write
    step.  This is because the duplicate can occur before the primary read.*/
 
-static int bam_mark_duplicates(md_param_t *param) {
+static int bam_mark_duplicates(md_param_t *param, char *arg_list) {
     bam_hdr_t *header = NULL;
     khiter_t k;
     khash_t(reads) *pair_hash        = kh_init(reads);
@@ -732,6 +733,13 @@ static int bam_mark_duplicates(md_param_t *param) {
            fprintf(stderr, "[markdup] error: queryname sorted, must be sorted by coordinate.\n");
            goto fail;
        }
+    }
+
+    if (bam_hdr_add_pg(header, "samtools", "VN", samtools_version(),
+                        arg_list ? "CL" : NULL,
+                        arg_list ? arg_list : NULL,
+                        NULL) != 0) {
+        fprintf(stderr, "[markdup] warning: unable to add @PG line to header.\n");
     }
 
     if (sam_hdr_write(param->out, header) < 0) {
@@ -1214,6 +1222,7 @@ int bam_markdup(int argc, char **argv) {
     struct stat st;
     unsigned int t;
     md_param_t param = {NULL, NULL, NULL, 0, 300, 0, 0, 0, 0, NULL};
+    char *args = stringify_argv(argc + 1, argv - 1);
 
     static const struct option lopts[] = {
         SAM_OPT_GLOBAL_OPTIONS('-', 0, 'O', 0, 0, '@'),
@@ -1286,7 +1295,7 @@ int bam_markdup(int argc, char **argv) {
     ksprintf(&tmpprefix, "samtools.%d.%u.tmp", (int) getpid(), t % 10000);
     param.prefix = tmpprefix.s;
 
-    ret = bam_mark_duplicates(&param);
+    ret = bam_mark_duplicates(&param, args);
 
     sam_close(param.in);
 
@@ -1297,6 +1306,7 @@ int bam_markdup(int argc, char **argv) {
 
     if (p.pool) hts_tpool_destroy(p.pool);
 
+    free(args);
     free(tmpprefix.s);
     sam_global_args_free(&ga);
 
