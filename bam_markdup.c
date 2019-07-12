@@ -746,7 +746,7 @@ static int bam_mark_duplicates(md_param_t *param, char *arg_list) {
     }
 
 
-    if (param->add_pg && bam_hdr_add_pg(header, "samtools", "VN", samtools_version(),
+    if (param->add_pg && sam_hdr_add_pg(header, "samtools", "VN", samtools_version(),
                         arg_list ? "CL" : NULL,
                         arg_list ? arg_list : NULL,
                         NULL) != 0) {
