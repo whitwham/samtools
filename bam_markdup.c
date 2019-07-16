@@ -703,7 +703,7 @@ static unsigned long estimate_library_size(unsigned long read_pairs, unsigned lo
    Marking the supplementary reads of a duplicate as also duplicates takes an extra file read/write
    step.  This is because the duplicate can occur before the primary read.*/
 
-static int bam_mark_duplicates(md_param_t *param, char *arg_list) {
+static int bam_mark_duplicates(md_param_t *param, char *arg_list, char *out_fn, int write_index) {
     bam_hdr_t *header = NULL;
     khiter_t k;
     khash_t(reads) *pair_hash        = kh_init(reads);
@@ -758,7 +758,7 @@ static int bam_mark_duplicates(md_param_t *param, char *arg_list) {
         goto fail;
     }
     if (write_index) {
-        if (!(idx_fn = auto_index(out, out_fn, header)))
+        if (!(idx_fn = auto_index(param->out, out_fn, header)))
             goto fail;
     }
 
@@ -1183,7 +1183,7 @@ static int bam_mark_duplicates(md_param_t *param, char *arg_list) {
     }
 
     if (write_index) {
-        if (sam_idx_save(out) < 0) {
+        if (sam_idx_save(param->out) < 0) {
             print_error_errno("markdup", "writing index failed");
             goto fail;
         }
@@ -1324,7 +1324,7 @@ int bam_markdup(int argc, char **argv) {
     ksprintf(&tmpprefix, "samtools.%d.%u.tmp", (int) getpid(), t % 10000);
     param.prefix = tmpprefix.s;
 
-    ret = bam_mark_duplicates(&param, args);
+    ret = bam_mark_duplicates(&param, args, argv[optind + 1], ga.write_index);
 
     sam_close(param.in);
 
