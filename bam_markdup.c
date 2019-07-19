@@ -528,9 +528,9 @@ static inline int get_coordinate_positions(const char *qname, int *xpos, int *yp
    close enough (set by max_dist) to the original to be counted as optical.*/
 
 static int optical_duplicate(bam1_t *ori, bam1_t *dup, long max_dist) {
-    int ret = 0, pos = 0, sep = 0, seps;
+    int ret = 0, seps;
     char *original, *duplicate;
-    int oxpos, oypos, dxpos, dypos;
+    int oxpos = 0, oypos = 0, dxpos = 0, dypos = 0;
 
 
     original  = bam_get_qname(ori);
@@ -620,12 +620,12 @@ static int mark_duplicates(md_param_t *param, khash_t(duplicates) *dup_hash, bam
 
     if (param->opt_dist) { // mark optical duplicates
         if (optical_duplicate(ori, dup, param->opt_dist)) {
-            bam_aux_append(dup, "dt", 'Z', 3, "SQ");
+            bam_aux_append(dup, "dt", 'Z', 3, (const uint8_t *)"SQ");
             dup_type = 'O';
             (*optical)++;
         } else {
             // not an optical duplicate
-            bam_aux_append(dup, "dt", 'Z', 3, "LB");
+            bam_aux_append(dup, "dt", 'Z', 3, (const uint8_t *)"LB");
         }
     }
 
@@ -1105,10 +1105,10 @@ static int bam_mark_duplicates(md_param_t *param, char *arg_list, char *out_fn, 
 
                     if (param->opt_dist) {
                         if (kh_val(dup_hash, k).type) {
-                            bam_aux_append(b, "dt", 'Z', 3, "SQ");
+                            bam_aux_append(b, "dt", 'Z', 3, (const uint8_t *)"SQ");
                             np_opt_duplicate++;
                         } else {
-                            bam_aux_append(b, "dt", 'Z', 3, "LB");
+                            bam_aux_append(b, "dt", 'Z', 3, (const uint8_t *)"LB");
                         }
                     }
                 }
