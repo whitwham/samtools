@@ -43,6 +43,7 @@ DEALINGS IN THE SOFTWARE.  */
 #include <htslib/klist.h>
 #include <htslib/khash_str2int.h>
 #include "samtools.h"
+#include "bedidx.h"
 #include "sam_opts.h"
 
 #define dummy_free(p)
@@ -131,10 +132,6 @@ static inline void pileup_seq(FILE *fp, const bam_pileup1_t *p, int pos, int ref
 
 #define MPLP_MAX_DEPTH 8000
 #define MPLP_MAX_INDEL_DEPTH 250
-
-void *bed_read(const char *fn);
-void bed_destroy(void *_h);
-int bed_overlap(const void *_h, const char *chr, int beg, int end);
 
 typedef struct {
     int min_mq, flag, min_baseQ, capQ_thres, max_depth, max_indel_depth, fmt_flag, all, rev_del;
