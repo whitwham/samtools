@@ -222,12 +222,18 @@ static int bam_trim_left(bam1_t *rec, uint32_t bases) {
     }
     
     new_n_cigar = j;
-    
     if (new_n_cigar != rec->core.n_cigar) {
-        new_seq_start = orig_seq + ((new_n_cigar - rec->core.n_cigar) * sizeof(uint32_t));
+        if (new_n_cigar > rec->core.n_cigar) {
+            new_seq_start = orig_seq + ((new_n_cigar - rec->core.n_cigar) * sizeof(uint32_t));
+        } else {
+            new_seq_start = orig_seq - ((rec->core.n_cigar - new_n_cigar) * sizeof(uint32_t));
+        } 
     } else {
         new_seq_start = orig_seq;
     }
+    
+    // fprintf(stderr, "new_n_cigar %d - rec->core.n_cigar %d = %d\n", new_n_cigar, rec->core.n_cigar, (new_n_cigar - rec->core.n_cigar));
+    // fprintf(stderr, "new_seq_start %p orig_seq %p\n", new_seq_start, orig_seq);
     
     new_qual = new_seq_start + (rec->core.l_qseq - bases + 1) / 2;
     // Move / shrink SEQ
@@ -268,6 +274,7 @@ static int bam_trim_left(bam1_t *rec, uint32_t bases) {
     // put in new pos
     rec->core.pos = new_pos;
     
+    free(new_cigar);
     return 0;
 }
 
@@ -341,10 +348,17 @@ static int bam_trim_right(bam1_t *rec, uint32_t bases) {
     }
     
     if (new_n_cigar != rec->core.n_cigar) {
-        new_seq_start = orig_seq + ((new_n_cigar - rec->core.n_cigar) * sizeof(uint32_t));
+        if (new_n_cigar > rec->core.n_cigar) {
+            new_seq_start = orig_seq + ((new_n_cigar - rec->core.n_cigar) * sizeof(uint32_t));
+        } else {
+            new_seq_start = orig_seq - ((rec->core.n_cigar - new_n_cigar) * sizeof(uint32_t));
+        } 
     } else {
         new_seq_start = orig_seq;
     }
+    
+    //fprintf(stderr, "new_n_cigar %d - rec->core.n_cigar %d = %d\n", new_n_cigar, rec->core.n_cigar, (new_n_cigar - rec->core.n_cigar));
+    // fprintf(stderr, "new_seq_start %p orig_seq %p\n", new_seq_start, orig_seq);
 
     new_qual = new_seq_start + (rec->core.l_qseq - bases + 1) / 2;
     // Move SEQ
@@ -366,13 +380,16 @@ static int bam_trim_right(bam1_t *rec, uint32_t bases) {
 
     // Set new l_data
     rec->l_data -= orig_aux - bam_get_aux(rec);
+    
+    free(new_cigar);
+    return 0;
 }
 
 
 static int bam_clip(samFile *in, samFile *out, char *bedfile, int add_pg, char *args) {
     bed_pair_t *positions;
     int pos_length, ret = 0, exclude = 0;
-    bam_hdr_t *header;
+    bam_hdr_t *header = NULL;
     bam1_t *b;
     long f_count = 0, r_count = 0, n_count = 0, l_count = 0, l_exclude = 0;
     
@@ -410,9 +427,9 @@ static int bam_clip(samFile *in, samFile *out, char *bedfile, int add_pg, char *
         
         l_count++;
         
-        // exclude |= (BAM_FUNMAP | BAM_FQCFAIL);
+        exclude |= (BAM_FUNMAP | BAM_FQCFAIL);
         
-        if (!exclude) {
+        if (!(b->core.flag & exclude)) {
 
             if (bam_is_rev(b)) {
                 pos = bam_endpos(b);
@@ -452,8 +469,9 @@ static int bam_clip(samFile *in, samFile *out, char *bedfile, int add_pg, char *
 
 
 
-
-
+    bam_destroy1(b);
+    sam_hdr_destroy(header);
+    
 fail: // better error handling later
     free(positions);
     return ret;
