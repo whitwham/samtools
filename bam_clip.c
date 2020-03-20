@@ -146,39 +146,45 @@ static int matching_clip_site(bed_pair_t *sites, int s_length, hts_pos_t pos) {
     return size;
 }
 
-
-static int bam_trim_left(bam1_t *rec, uint32_t bases) {
+    
+static int bam_trim_left(bam1_t *rec, bam1_t *rec_out, uint32_t bases) {
     uint32_t *orig_cigar = bam_get_cigar(rec);
     uint8_t *orig_seq = bam_get_seq(rec);
     uint8_t *orig_qual = bam_get_qual(rec);
     uint8_t *orig_aux = bam_get_aux(rec);
     uint32_t *new_cigar;
-    uint32_t new_n_cigar;
     uint8_t *new_qual;
     size_t orig_l_aux = bam_get_l_aux(rec);
     uint32_t i, j;
     uint32_t removed = bases, hardclip = 0;
     hts_pos_t new_pos = rec->core.pos;
     uint32_t cig_type;
-    uint8_t *new_seq_start;
-    
+
+    if (rec->l_data + 4 > rec_out->m_data) {
+        uint8_t *new_data = realloc(rec_out->data, rec->l_data + 4);
+        if (!new_data) {
+            fprintf(stderr, "Couldn't allocate memoy for new bam record\n");
+            return 1;
+        }
+        rec_out->data = new_data;
+        rec_out->m_data = rec->l_data + 4;
+    }
+
+    // Copy core data & name  
+    memcpy(&rec_out->core, &rec->core, sizeof(rec->core));
+    memcpy(rec_out->data, rec->data, rec->core.l_qname);
+
     if (bases >= rec->core.l_qseq) {
-        rec->core.l_qseq = 0;
-        rec->core.n_cigar = 0;
+        rec_out->core.l_qseq = 0;
+        rec_out->core.n_cigar = 0;
         if (orig_l_aux)
-            memmove(bam_get_aux(rec), orig_aux, orig_l_aux);
-        rec->l_data -= orig_aux - bam_get_aux(rec);
+            memcpy(bam_get_aux(rec_out), orig_aux, orig_l_aux);
+        rec->l_data -= bam_get_aux(rec) - rec_out->data + orig_l_aux;
         return 1;
     }
 
-    // Shrink CIGAR here
-    
-    // make memory for a temporary cigar string, one bigger than the original
-    // to account for the extra H operation
-    if ((new_cigar = malloc((rec->core.n_cigar + 1) * sizeof(uint32_t))) == NULL) {
-        fprintf(stderr, "[clip] error: unable to allocate memory for new cigar string.\n");
-        return 1;
-    }
+    // Modify CIGAR here
+    new_cigar = bam_get_cigar(rec_out);
     
     for (i = 0;  i < rec->core.n_cigar; i++) {
         cig_type = bam_cigar_type(bam_cigar_op(orig_cigar[i]));
@@ -220,29 +226,17 @@ static int bam_trim_left(bam1_t *rec, uint32_t bases) {
     for (; i < rec->core.n_cigar; i++) {
          new_cigar[j++] = orig_cigar[i];
     }
-    
-    new_n_cigar = j;
-    if (new_n_cigar != rec->core.n_cigar) {
-        if (new_n_cigar > rec->core.n_cigar) {
-            new_seq_start = orig_seq + ((new_n_cigar - rec->core.n_cigar) * sizeof(uint32_t));
-        } else {
-            new_seq_start = orig_seq - ((rec->core.n_cigar - new_n_cigar) * sizeof(uint32_t));
-        } 
-    } else {
-        new_seq_start = orig_seq;
-    }
-    
-    // fprintf(stderr, "new_n_cigar %d - rec->core.n_cigar %d = %d\n", new_n_cigar, rec->core.n_cigar, (new_n_cigar - rec->core.n_cigar));
-    // fprintf(stderr, "new_seq_start %p orig_seq %p\n", new_seq_start, orig_seq);
-    
-    new_qual = new_seq_start + (rec->core.l_qseq - bases + 1) / 2;
-    // Move / shrink SEQ
+
+    rec_out->core.n_cigar = j;
+
+    new_qual = bam_get_seq(rec_out) + (rec->core.l_qseq - bases + 1) / 2;
+    // Copy remaining SEQ
     if ((bases & 1) == 0) {
-        memmove(new_seq_start, orig_seq + (bases / 2),
+        memcpy(bam_get_seq(rec_out), orig_seq + (bases / 2),
 	        (rec->core.l_qseq - bases) / 2);
     } else {
         uint8_t *in = orig_seq + bases / 2;
-        uint8_t *out = new_seq_start;
+        uint8_t *out = bam_get_seq(rec_out);
         uint32_t i;
         for (i = bases; i < rec->core.l_qseq - 1; i += 2) {
             *out++ = ((in[0] & 0x0f) << 4) | ((in[1] & 0xf0) >> 4);
@@ -253,33 +247,28 @@ static int bam_trim_left(bam1_t *rec, uint32_t bases) {
         }
         assert(out == new_qual);
     }
-    
-    // now the sequence is in position put the new cigar string in
-    memcpy(orig_cigar, new_cigar, new_n_cigar * sizeof(uint32_t));
-    rec->core.n_cigar = new_n_cigar;
 
-    // Move / shrink QUAL
+    // Copy remaining QUAL
     memmove(new_qual, orig_qual, rec->core.l_qseq - bases);
 
     // Set new l_qseq
-    rec->core.l_qseq -= bases;
+    rec_out->core.l_qseq -= bases;
 
     // Move AUX
     if (orig_l_aux)
-        memmove(bam_get_aux(rec), orig_aux, orig_l_aux);
+        memcpy(bam_get_aux(rec_out), orig_aux, orig_l_aux);
 
     // Set new l_data
-    rec->l_data -= orig_aux - bam_get_aux(rec);
+    rec_out->l_data = bam_get_aux(rec_out) - rec_out->data + orig_l_aux;
     
     // put in new pos
-    rec->core.pos = new_pos;
+    rec_out->core.pos = new_pos;
     
-    free(new_cigar);
     return 0;
 }
 
 
-static int bam_trim_right(bam1_t *rec, uint32_t bases) {
+static int bam_trim_right(bam1_t *rec, bam1_t *rec_out, uint32_t bases) {
     uint32_t *orig_cigar = bam_get_cigar(rec);
     uint8_t *orig_seq = bam_get_seq(rec);
     uint8_t *orig_qual = bam_get_qual(rec);
@@ -292,34 +281,42 @@ static int bam_trim_right(bam1_t *rec, uint32_t bases) {
     int32_t j;
     uint32_t removed = bases, hardclip = 0;
     uint32_t cig_type;
-    uint8_t *new_seq_start;
+
+    if (rec->l_data + 4 > rec_out->m_data) {
+        uint8_t *new_data = realloc(rec_out->data, rec->l_data + 4);
+        if (!new_data) {
+            fprintf(stderr, "Couldn't allocate memoy for new bam record\n");
+            return 1;
+        }
+        rec_out->data = new_data;
+        rec_out->m_data = rec->l_data + 4;
+    }
+
+    // Copy core data & name
+    memcpy(&rec_out->core, &rec->core, sizeof(rec->core));
+    memcpy(rec_out->data, rec->data, rec->core.l_qname);
 
     if (bases >= rec->core.l_qseq) {
-        rec->core.l_qseq = 0;
-        rec->core.n_cigar = 0;
+        rec_out->core.l_qseq = 0;
+        rec_out->core.n_cigar = 0;
         if (orig_l_aux)
-            memmove(bam_get_aux(rec), orig_aux, orig_l_aux);
-        rec->l_data -= orig_aux - bam_get_aux(rec);
-        return 1;
-    }
-    
-    // Shrink CIGAR here
-
-    // make memory for a temporary cigar string, one bigger than the original
-    // to account for the extra H operation
-    if ((new_cigar = malloc((rec->core.n_cigar + 1) * sizeof(uint32_t))) == NULL) {
-        fprintf(stderr, "[clip] error: unable to allocate memory for new cigar string.\n");
+            memcpy(bam_get_aux(rec_out), orig_aux, orig_l_aux);
+        rec_out->l_data = bam_get_aux(rec_out) - rec_out->data + orig_l_aux;
         return 1;
     }
 
-    for (i = rec->core.n_cigar - 1;  i > 0; i--) {
+    // Modify CIGAR here
+    new_cigar = bam_get_cigar(rec_out);
+
+    for (i = rec->core.n_cigar;  i > 0;) {
+        i--;
         cig_type = bam_cigar_type(bam_cigar_op(orig_cigar[i]));
         
         if (cig_type == 0) {
             hardclip += bam_cigar_oplen(orig_cigar[i]);
         } else {
             if (cig_type & 1) {
-                if (bam_cigar_oplen(orig_cigar[i]) < removed) {
+                if (bam_cigar_oplen(orig_cigar[i]) <= removed) {
                     removed -= bam_cigar_oplen(orig_cigar[i]);
                 } else {
                     break;
@@ -329,60 +326,92 @@ static int bam_trim_right(bam1_t *rec, uint32_t bases) {
     }
     
     cig_type = bam_cigar_type(bam_cigar_op(orig_cigar[i]));
+    assert((cig_type & 1) && bam_cigar_oplen(orig_cigar[i]) > removed);
     
-    j = rec->core.n_cigar;
-    new_cigar[j--] = bam_cigar_gen(hardclip + bases, BAM_CHARD_CLIP);
+    j = i + 1;
+    new_cigar[j] = bam_cigar_gen(hardclip + bases, BAM_CHARD_CLIP);
     new_n_cigar++;
 
-    if (bam_cigar_oplen(orig_cigar[i]) != removed) {
-        new_cigar[j--] = bam_cigar_gen(bam_cigar_oplen(orig_cigar[i]) - removed, bam_cigar_op(orig_cigar[i]));
-        new_n_cigar++;
-    }
+    new_cigar[--j] = bam_cigar_gen(bam_cigar_oplen(orig_cigar[i]) - removed, bam_cigar_op(orig_cigar[i]));
+    new_n_cigar++;
     
     // fill in the rest of the cigar
-    i++;
-    
-    for (; i < rec->core.n_cigar; i++) {
-        new_cigar[j--] = orig_cigar[i];
+    while (i > 0) {
+        new_cigar[--j] = orig_cigar[--i];
         new_n_cigar++;
     }
-    
-    if (new_n_cigar != rec->core.n_cigar) {
-        if (new_n_cigar > rec->core.n_cigar) {
-            new_seq_start = orig_seq + ((new_n_cigar - rec->core.n_cigar) * sizeof(uint32_t));
-        } else {
-            new_seq_start = orig_seq - ((rec->core.n_cigar - new_n_cigar) * sizeof(uint32_t));
-        } 
-    } else {
-        new_seq_start = orig_seq;
-    }
-    
-    //fprintf(stderr, "new_n_cigar %d - rec->core.n_cigar %d = %d\n", new_n_cigar, rec->core.n_cigar, (new_n_cigar - rec->core.n_cigar));
-    // fprintf(stderr, "new_seq_start %p orig_seq %p\n", new_seq_start, orig_seq);
 
-    new_qual = new_seq_start + (rec->core.l_qseq - bases + 1) / 2;
-    // Move SEQ
-    memmove(new_seq_start, orig_seq, (rec->core.l_qseq - bases + 1) / 2);
+    rec_out->core.n_cigar = new_n_cigar;
 
-    // now the sequence is in position put the new cigar string in
-    memcpy(orig_cigar, new_cigar, new_n_cigar * sizeof(uint32_t));
-    rec->core.n_cigar = new_n_cigar;
+    new_qual = bam_get_seq(rec_out) + (rec->core.l_qseq - bases + 1) / 2;
+    // Copy remaining SEQ
+    memcpy(bam_get_seq(rec_out), orig_seq, (rec->core.l_qseq - bases + 1) / 2);
 
-    // Move / shrink QUAL
-    memmove(new_qual, orig_qual, rec->core.l_qseq - bases);
+    // Copy remaining QUAL
+    memcpy(new_qual, orig_qual, rec->core.l_qseq - bases);
 
     // Set new l_qseq
-    rec->core.l_qseq -= bases;
+    rec_out->core.l_qseq -= bases;
 
-    // Move AUX
+    // Copy AUX
     if (orig_l_aux)
-        memmove(bam_get_aux(rec), orig_aux, orig_l_aux);
+        memcpy(bam_get_aux(rec_out), orig_aux, orig_l_aux);
 
     // Set new l_data
-    rec->l_data -= orig_aux - bam_get_aux(rec);
-    
-    free(new_cigar);
+    rec_out->l_data = bam_get_aux(rec_out) - rec_out->data + orig_l_aux;
+
     return 0;
+}
+
+static inline void swap_bams(bam1_t **a, bam1_t **b) {
+    bam1_t *tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
+
+/* Calculate the current read's start based on the stored cigar string. */
+static hts_pos_t unclipped_start(bam1_t *b) {
+    uint32_t *cigar = bam_get_cigar(b);
+    int64_t clipped = 0;
+    uint32_t i;
+
+    for (i = 0; i < b->core.n_cigar; i++) {
+        char c = bam_cigar_opchr(cigar[i]);
+
+        if (c == 'S' || c == 'H') { // clips
+            clipped += bam_cigar_oplen(cigar[i]);
+        } else {
+            break;
+        }
+    }
+
+    return b->core.pos - clipped + 1;
+}
+
+
+/* Calculate the current read's end based on the stored cigar string. */
+static hts_pos_t unclipped_end(bam1_t *b) {
+    uint32_t *cigar = bam_get_cigar(b);
+    hts_pos_t end_pos, clipped = 0;
+    int32_t i;
+
+    end_pos = bam_endpos(b);
+
+    // now get the clipped end bases (if any)
+    // if we get to the beginning of the cigar string
+    // without hitting a non-clip then the results are meaningless
+    for (i = b->core.n_cigar - 1; i >= 0; i--) {
+        char c = bam_cigar_opchr(cigar[i]);
+
+        if (c == 'S' || c == 'H') { // clips
+            clipped += bam_cigar_oplen(cigar[i]);
+        } else {
+            break;
+        }
+    }
+
+    return end_pos + clipped;
 }
 
 
@@ -390,7 +419,7 @@ static int bam_clip(samFile *in, samFile *out, char *bedfile, int add_pg, char *
     bed_pair_t *positions;
     int pos_length, ret = 0, exclude = 0;
     bam_hdr_t *header = NULL;
-    bam1_t *b;
+    bam1_t *b, *b_tmp = NULL;
     long f_count = 0, r_count = 0, n_count = 0, l_count = 0, l_exclude = 0;
     
     if ((positions = load_bed_file_pairs(bedfile, &pos_length)) == NULL) {
@@ -419,6 +448,7 @@ static int bam_clip(samFile *in, samFile *out, char *bedfile, int add_pg, char *
     
     // TODO add write index
     b = bam_init1();
+    b_tmp = bam_init1();
     
     while ((ret = sam_read1(in, header, b)) >= 0) {
         hts_pos_t pos;
@@ -432,19 +462,25 @@ static int bam_clip(samFile *in, samFile *out, char *bedfile, int add_pg, char *
         if (!(b->core.flag & exclude)) {
 
             if (bam_is_rev(b)) {
-                pos = bam_endpos(b);
+                pos = unclipped_end(b);
                 is_rev = 1;
             } else {
-                pos = b->core.pos;
+                pos = unclipped_start(b);
                 is_rev = 0;
             }
 
             if ((p_size = matching_clip_site(positions, pos_length, pos))) {
                 if (is_rev) {
-                    bam_trim_right(b, p_size);
+                    if (bam_trim_right(b, b_tmp, p_size) != 0)
+                        goto fail;
+                        
+                    swap_bams(&b, &b_tmp);
                     r_count++;
                 } else {
-                    bam_trim_left(b, p_size);
+                    if (bam_trim_left(b, b_tmp, p_size) != 0)
+                        goto fail;
+                        
+                    swap_bams(&b, &b_tmp);
                     f_count++;
                 }
             } else {
