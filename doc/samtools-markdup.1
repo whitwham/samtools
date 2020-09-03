@@ -60,6 +60,7 @@ samtools markdup
 .RB [ --mode ]
 .RB [ --include-fails ]
 .RB [ --no-PG ]
+.RB [ --max-dup-check ]
 .RB [ -u ]
 .I in.algsort.bam out.bam
 
@@ -125,6 +126,12 @@ Do not add a PG line to the output file.
 .TP
 .BI "-@, --threads " INT
 Number of input/output compression threads to use in addition to main thread [0].
+.TP
+.BI "--max-dup-check " INT
+The maximum number of duplicates of a single read to check for correctness of
+optical and \fBdo\fR tags.  As each new duplicate of a read is added, all are
+checked to see if the tags are still correct.  With a great many duplicates
+unrestricted checking can cause a severe slowdown.  Default [16].
 
 .SH STATISTICS
 Entries are:

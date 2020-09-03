@@ -62,6 +62,7 @@ typedef struct {
     int mode;
     int write_index;
     int include_fails;
+    int max_chain;
     char *stats_file;
     char *arg_list;
     char *out_fn;
@@ -909,8 +910,9 @@ static int duplicate_chain_check(md_param_t *param, khash_t(duplicates) *dup_has
     char *ori_name = bam_get_qname(ori->b);
     int have_original = !(ori->b->core.flag & BAM_FDUP);
     int ori_paired = (ori->b->core.flag & BAM_FPAIRED) && !(ori->b->core.flag & BAM_FMUNMAP);
+    int checked = 0; // too many checks on many duplicates slows everything down
 
-    while (current) {
+    while (current && checked < param->max_chain) {
         int current_paired = (current->b->core.flag & BAM_FPAIRED) && !(current->b->core.flag & BAM_FMUNMAP);
 
         if (param->tag && have_original) {
@@ -1047,6 +1049,7 @@ static int duplicate_chain_check(md_param_t *param, khash_t(duplicates) *dup_has
         }
 
         current = current->duplicate;
+        checked++;
     }
 
     return ret;
@@ -1307,8 +1310,9 @@ static int bam_mark_duplicates(md_param_t *param) {
 
                         single_dup++;
 
-                        if (duplicate_chain_check(param, dup_hash, bp->p, &opt_warnings, &single_optical, &optical))
-                            goto fail;
+                        if (param->max_chain && (param->tag || param->opt_dist))
+                            if (duplicate_chain_check(param, dup_hash, bp->p, &opt_warnings, &single_optical, &optical))
+                                goto fail;
 
                     }
                 } else {
@@ -1383,13 +1387,15 @@ static int bam_mark_duplicates(md_param_t *param) {
                     if (mark_duplicates(param, dup_hash, bp->p->b, dup, &optical, &opt_warnings))
                         goto fail;
 
-                    if (check_chain) {
-                        if (duplicate_chain_check(param, dup_hash, bp->p->duplicate, &opt_warnings, &single_optical, &optical))
+                    if (param->max_chain && (param->tag || param->opt_dist)) {
+                        if (check_chain) {
+                            if (duplicate_chain_check(param, dup_hash, bp->p->duplicate, &opt_warnings, &single_optical, &optical))
+                                goto fail;
+                        }
+
+                        if (duplicate_chain_check(param, dup_hash, bp->p, &opt_warnings, &single_optical, &optical))
                             goto fail;
                     }
-
-                    if (duplicate_chain_check(param, dup_hash, bp->p, &opt_warnings, &single_optical, &optical))
-                        goto fail;
 
                     duplicate++;
                 } else {
@@ -1429,16 +1435,17 @@ static int bam_mark_duplicates(md_param_t *param) {
                         if (mark_duplicates(param, dup_hash, bp->p->b, in_read->b, &single_optical, &opt_warnings))
                             goto fail;
 
-                        if (check_chain) {
-                            // check the new duplicate entry in the chain
-                            if (duplicate_chain_check(param, dup_hash, bp->p->duplicate, &opt_warnings, &single_optical, &optical))
-                                    goto fail;
+                        if (param->max_chain && (param->tag || param->opt_dist)) {
+                            if (check_chain) {
+                                // check the new duplicate entry in the chain
+                                if (duplicate_chain_check(param, dup_hash, bp->p->duplicate, &opt_warnings, &single_optical, &optical))
+                                        goto fail;
+                            }
+
+                            // check against the new original
+                            if (duplicate_chain_check(param, dup_hash, bp->p, &opt_warnings, &single_optical, &optical))
+                                goto fail;
                         }
-
-                        // check against the new original
-                        if (duplicate_chain_check(param, dup_hash, bp->p, &opt_warnings, &single_optical, &optical))
-                            goto fail;
-
                     } else {
                         int64_t old_score, new_score;
                         bam1_t *dup;
@@ -1465,17 +1472,16 @@ static int bam_mark_duplicates(md_param_t *param) {
                         if (mark_duplicates(param, dup_hash, bp->p->b, dup, &single_optical, &opt_warnings))
                             goto fail;
 
+                        if (param->max_chain && (param->tag || param->opt_dist)) {
+                            if (check_chain) {
+                                if (duplicate_chain_check(param, dup_hash, bp->p->duplicate, &opt_warnings, &single_optical, &optical))
+                                    goto fail;
+                            }
 
-                        if (check_chain) {
-                            if (duplicate_chain_check(param, dup_hash, bp->p->duplicate, &opt_warnings, &single_optical, &optical))
+                            if (duplicate_chain_check(param, dup_hash, bp->p, &opt_warnings, &single_optical, &optical))
                                 goto fail;
                         }
-
-                        if (duplicate_chain_check(param, dup_hash, bp->p, &opt_warnings, &single_optical, &optical))
-                            goto fail;
-
-
-                        }
+                    }
 
                     single_dup++;
                 } else {
@@ -1495,6 +1501,7 @@ static int bam_mark_duplicates(md_param_t *param) {
 
             /* keep a moving window of reads based on coordinates and max read length.  Any unaligned reads
                should just be written as they cannot be matched as duplicates. */
+
             if (in_read->pos + param->max_length > prev_coord && in_read->b->core.tid == prev_tid && (prev_tid != -1 || prev_coord != -1)) {
                 break;
             }
@@ -1747,6 +1754,8 @@ static int markdup_usage(void) {
     fprintf(stderr, "  -u               Output uncompressed data\n");
     fprintf(stderr, "  --include-fails  Include quality check failed reads.\n");
     fprintf(stderr, "  --no-PG          Do not add a PG line\n");
+    fprintf(stderr, "  --max-dup-check  For multiple duplicates of the same read, check correctness of optical\n"
+                    "                   and \'do\' tags.  Default [16] deep.\n");
     fprintf(stderr, "  -t               Mark primary duplicates with the name of the original in a \'do\' tag."
                                   " Mainly for information and debugging.\n");
 
@@ -1767,13 +1776,14 @@ int bam_markdup(int argc, char **argv) {
     kstring_t tmpprefix = {0, 0, NULL};
     struct stat st;
     unsigned int t;
-    md_param_t param = {NULL, NULL, NULL, 0, 300, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL};
+    md_param_t param = {NULL, NULL, NULL, 0, 300, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, NULL, NULL, NULL};
 
     static const struct option lopts[] = {
         SAM_OPT_GLOBAL_OPTIONS('-', 0, 'O', 0, 0, '@'),
         {"include-fails", no_argument, NULL, 1001},
         {"no-PG", no_argument, NULL, 1002},
         {"mode", required_argument, NULL, 'm'},
+        {"max-dup-check", required_argument, NULL, 1003},
         {NULL, 0, NULL, 0}
     };
 
@@ -1802,6 +1812,7 @@ int bam_markdup(int argc, char **argv) {
             case 'u': wmode[2] = '0'; break;
             case 1001: param.include_fails = 1; break;
             case 1002: param.no_pg = 1; break;
+            case 1003: param.max_chain = atoi(optarg); break;
             default: if (parse_sam_global_opt(c, optarg, lopts, &ga) == 0) break;
             /* else fall-through */
             case '?': return markdup_usage();
