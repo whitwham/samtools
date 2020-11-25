@@ -1058,12 +1058,12 @@ static int check_chain_against_original(md_param_t *param, khash_t(duplicates) *
 
         if (param->tag) {
             uint8_t *data;
-
+            
             // at this stage all duplicates should have a do tag
             if ((data = bam_aux_get(current->b, "do")) != NULL) {
                 // see if we need to change the tag
                 char *old_name = bam_aux2Z(data);
-
+                
                 if (old_name) {
                     if (strcmp(old_name, ori_name) != 0) {
                         if (bam_aux_update_str(current->b, "do", strlen(ori_name) + 1, (const char *)ori_name)) {
@@ -1262,8 +1262,9 @@ static int find_duplicate_chains(md_param_t *param, klist_t(read_queue) *read_bu
 
         if (check_range) {
             /* Just check against the moving window of reads based on coordinates and max read length. */
-            if (in_read->pos + param->max_length > prev_coord && in_read->b->core.tid == prev_tid && (prev_tid != -1 || prev_coord != -1)) {
-                break;
+            if (in_read->pos + param->max_length > prev_coord && in_read->b->core.tid == prev_tid && (prev_tid != -1 || prev_coord != -1) && !bam_get_qname(in_read->b)) {
+                rq = kl_next(rq);
+                continue;
             }
         } else {
             // this is the last set of results and the end entry will be blank
@@ -1290,6 +1291,8 @@ static int find_duplicate_chains(md_param_t *param, klist_t(read_queue) *read_bu
                 ret = -1;
                 break;
             }
+            
+            in_read->duplicate = NULL;
         }
 
         rq = kl_next(rq);
@@ -1460,8 +1463,11 @@ static int bam_mark_duplicates(md_param_t *param) {
         fprintf(stderr, "[markdup] error: unable to allocate memory for alignment.\n");
         goto fail;
     }
+    
+    if (param->check_chain && !(param->tag || param->opt_dist))
+        param->check_chain = 0;
 
-    if (param->check_chain && (param->tag || param->opt_dist)) {
+    if (param->check_chain) {
         dup_list.size = 128;
         dup_list.c = NULL;
 
@@ -1476,7 +1482,7 @@ static int bam_mark_duplicates(md_param_t *param) {
 
     while ((ret = sam_read1(param->in, header, in_read->b)) >= 0) {
         int dup_checked = 0;
-
+        
         // do some basic coordinate order checks
         if (in_read->b->core.tid >= 0) { // -1 for unmapped reads
             if (in_read->b->core.tid < prev_tid ||
@@ -1517,7 +1523,7 @@ static int bam_mark_duplicates(md_param_t *param) {
         // read must not be secondary, supplementary, unmapped or (possibly) failed QC
         if (!(in_read->b->core.flag & exclude)) {
             examined++;
-
+            
             // look at the pairs first
             if ((in_read->b->core.flag & BAM_FPAIRED) && !(in_read->b->core.flag & BAM_FMUNMAP)) {
                 int ret, mate_tmp;
@@ -1563,7 +1569,7 @@ static int bam_mark_duplicates(md_param_t *param) {
                             in_read->duplicate = bp->p;
 
                         bp->p = in_read;
-
+                        
                         if (mark_duplicates(param, dup_hash, bp->p->b, dup, &single_optical, &opt_warnings))
                             goto fail;
 
@@ -1584,7 +1590,7 @@ static int bam_mark_duplicates(md_param_t *param) {
                     in_read->pair_key = pair_key;
                 } else if (ret == 0) {
                     int64_t old_score, new_score, tie_add = 0;
-                    bam1_t *dup;
+                    bam1_t *dup = NULL;
 
                     bp = &kh_val(pair_hash, k);
 
@@ -1641,7 +1647,7 @@ static int bam_mark_duplicates(md_param_t *param) {
 
                         dup = in_read->b;
                     }
-
+                    
                     if (mark_duplicates(param, dup_hash, bp->p->b, dup, &optical, &opt_warnings))
                         goto fail;
 
@@ -1685,7 +1691,7 @@ static int bam_mark_duplicates(md_param_t *param) {
 
                     } else {
                         int64_t old_score, new_score;
-                        bam1_t *dup;
+                        bam1_t *dup = NULL;
 
                         old_score = calc_score(bp->p->b);
                         new_score = calc_score(in_read->b);
@@ -1774,7 +1780,7 @@ static int bam_mark_duplicates(md_param_t *param) {
                 k = kh_get(reads, single_hash, in_read->single_key);
                 kh_del(reads, single_hash, k);
             }
-
+            
             kl_shift(read_queue, read_buffer, NULL);
             bam_destroy1(in_read->b);
             rq = kl_begin(read_buffer);
@@ -1824,11 +1830,11 @@ static int bam_mark_duplicates(md_param_t *param) {
                         goto fail;
                     }
                 }
-
+                
                 writing++;
             }
         }
-
+        
         kl_shift(read_queue, read_buffer, NULL);
         bam_destroy1(in_read->b);
         rq = kl_begin(read_buffer);
