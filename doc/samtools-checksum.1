@@ -319,6 +319,11 @@ Checksums in version 1.0 were incorrectly calculated if the \fB-M\fR
 (\fB--check-mate\fR) flag was set.  Version 2.0 fixed this issue but made
 previous checksums invalid.  This option replicates version 1.0 behaviour.
 
+Note Samtools version 1.24 produced corrected checksums but
+erroneously labelled them as version 1.0.  If you used this release
+with the \fB--check-mate\fR option then we advise recomputing or
+manually editing the version numbers in the output files.
+
 .SH EXAMPLES
 .IP o 2
 To check that an aligned and position sorted file contains the same
